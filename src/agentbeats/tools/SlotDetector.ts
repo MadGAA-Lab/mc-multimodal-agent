@@ -599,6 +599,114 @@ export function samplePatchFingerprint(
   return { meanR, meanG, meanB, stddev: Math.sqrt(varSum / n) };
 }
 
+/** Crop a slot-sized pixel patch with empty-slot grey BG masked out.
+ *  Stored as flat RGBA + foreground mask (1=icon, 0=BG). Sample from
+ *  RAW obs (not the marked frame) so the SoM yellow badges don't get
+ *  baked into the reference patch. Empty-slot baseline is ~RGB(139,
+ *  139,139); pixels within MASK_NEAR_GREY of that are masked out so
+ *  cursor-hover highlight (which raises the slot interior brightness
+ *  but doesn't change item icon pixels much) doesn't break later
+ *  match comparisons. */
+export function samplePatchPixels(
+  jpegBase64: string,
+  cx: number,
+  cy: number,
+  size = 14,
+): { w: number; h: number; rgba: Uint8Array; mask: Uint8Array } | null {
+  const cleaned = jpegBase64.startsWith("data:image/")
+    ? jpegBase64.replace(/^data:image\/[a-z]+;base64,/, "")
+    : jpegBase64;
+  let decoded;
+  try {
+    decoded = jpeg.decode(Buffer.from(cleaned, "base64"), { useTArray: true, formatAsRGBA: true });
+  } catch {
+    return null;
+  }
+  const { width: w, height: h, data } = decoded;
+  const half = Math.floor(size / 2);
+  const x0 = cx - half, y0 = cy - half;
+  if (x0 < 0 || y0 < 0 || x0 + size > w || y0 + size > h) return null;
+  const rgba = new Uint8Array(size * size * 4);
+  const mask = new Uint8Array(size * size);
+  // Empty-slot baseline color (~139,139,139) plus tolerance for
+  // hover-highlight (which lifts brightness uniformly).
+  const BG_GREY = 139;
+  const BG_TOL = 18;
+  for (let dy = 0; dy < size; dy += 1) {
+    for (let dx = 0; dx < size; dx += 1) {
+      const sx = x0 + dx, sy = y0 + dy;
+      const si = (sy * w + sx) * 4;
+      const di = (dy * size + dx) * 4;
+      const mi = dy * size + dx;
+      rgba[di] = data[si];
+      rgba[di + 1] = data[si + 1];
+      rgba[di + 2] = data[si + 2];
+      rgba[di + 3] = 255;
+      // Foreground mask: not near grey baseline AND not near-uniform
+      // bright (hover highlight is ~lighter grey, also masked out).
+      const r = data[si], g = data[si + 1], b = data[si + 2];
+      const lum = (r + g + b) / 3;
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+      const isBg = chroma <= 6 && Math.abs(lum - BG_GREY) <= BG_TOL;
+      mask[mi] = isBg ? 0 : 1;
+    }
+  }
+  return { w: size, h: size, rgba, mask };
+}
+
+/** Pixel-wise patch comparison via SSD over the intersection of
+ *  both patches' foreground masks. Returns a similarity score in
+ *  [0, 1] where 1 = identical foreground pixels. Returns 0 when the
+ *  patches share no foreground (one is empty / both BG). */
+export function patchSimilarity(
+  a: { w: number; h: number; rgba: Uint8Array; mask: Uint8Array },
+  b: { w: number; h: number; rgba: Uint8Array; mask: Uint8Array },
+): number {
+  if (a.w !== b.w || a.h !== b.h) return 0;
+  const n = a.w * a.h;
+  let fgCount = 0;
+  let ssd = 0;
+  for (let i = 0; i < n; i += 1) {
+    if (a.mask[i] === 0 || b.mask[i] === 0) continue;
+    fgCount += 1;
+    const off = i * 4;
+    const dr = a.rgba[off] - b.rgba[off];
+    const dg = a.rgba[off + 1] - b.rgba[off + 1];
+    const db = a.rgba[off + 2] - b.rgba[off + 2];
+    ssd += dr * dr + dg * dg + db * db;
+  }
+  if (fgCount === 0) return 0;
+  // Normalize: per-pixel SSD over 3 channels at 255² each = 195075.
+  // Map to similarity in [0, 1]: 1 - sqrt(meanSSD)/255.
+  const meanSSD = ssd / fgCount;
+  const rms = Math.sqrt(meanSSD / 3);
+  return Math.max(0, 1 - rms / 255);
+}
+
+/** Raw-RGBA RMS distance between two same-shape patches sampled at
+ *  the same pixel position. Used to detect whether a slot's contents
+ *  changed between two park-state snapshots: same position before
+ *  and after, no need to mask BG (empty pixels match empty pixels,
+ *  contributing 0 to the sum). Returns the per-pixel RMS in
+ *  RGB-distance units; threshold ~25 reliably separates "no change"
+ *  (sub-noise) from "item appeared/disappeared/swapped." */
+export function patchPixelRms(
+  a: { w: number; h: number; rgba: Uint8Array },
+  b: { w: number; h: number; rgba: Uint8Array },
+): number {
+  if (a.w !== b.w || a.h !== b.h) return Infinity;
+  const n = a.w * a.h;
+  let ssd = 0;
+  for (let i = 0; i < n; i += 1) {
+    const off = i * 4;
+    const dr = a.rgba[off] - b.rgba[off];
+    const dg = a.rgba[off + 1] - b.rgba[off + 1];
+    const db = a.rgba[off + 2] - b.rgba[off + 2];
+    ssd += dr * dr + dg * dg + db * db;
+  }
+  return Math.sqrt(ssd / (n * 3));
+}
+
 /** Debug variant: return ALL plausible cursor components (useful for
  *  triaging false positives during calibration). */
 export function detectCursorCandidates(
@@ -738,15 +846,83 @@ export function discoverSlots(jpegBase64: string): DiscoveredLayout | null {
   }
   if (candidates.length === 0) return null;
 
-  // Raster-order by row band, then x. Row band = quantize cy to slot stride.
-  const stride = Math.max(8, Math.round(expectedSide * 1.1));
-  candidates.sort((a, b) => {
-    const ra = Math.round(a.cy / stride);
-    const rb = Math.round(b.cy / stride);
-    if (ra !== rb) return ra - rb;
-    return a.cx - b.cx;
-  });
-  candidates.forEach((s, i) => { s.index = i; });
+  // Overlap union-merge: when two bboxes overlap significantly (e.g. a
+  // wide item icon like diamond_sword whose tip+handle pixels flood-fill
+  // into two separate components that each fall inside the slot, or
+  // armor pieces with internal gaps), MERGE them into a single bbox
+  // covering both. We score overlap by intersection-over-union; anything
+  // >0.1 (10%+ overlap) is treated as belonging to the same slot.
+  //
+  // Previous behaviour DROPPED the smaller component, which lost the
+  // outer extent of icons that spanned past one component's bounds and
+  // mis-positioned the slot center for items with disjoint pixel groups.
+  {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      outer: for (let i = 0; i < candidates.length; i += 1) {
+        const a = candidates[i];
+        const ax0 = a.x, ay0 = a.y, ax1 = a.x + a.w - 1, ay1 = a.y + a.h - 1;
+        const aArea = a.w * a.h;
+        for (let j = i + 1; j < candidates.length; j += 1) {
+          const b = candidates[j];
+          const bx0 = b.x, by0 = b.y, bx1 = b.x + b.w - 1, by1 = b.y + b.h - 1;
+          const bArea = b.w * b.h;
+          const ix0 = Math.max(ax0, bx0), iy0 = Math.max(ay0, by0);
+          const ix1 = Math.min(ax1, bx1), iy1 = Math.min(ay1, by1);
+          if (ix1 < ix0 || iy1 < iy0) continue;
+          const inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1);
+          const iou = inter / (aArea + bArea - inter);
+          if (iou > 0.1) {
+            const ux0 = Math.min(ax0, bx0);
+            const uy0 = Math.min(ay0, by0);
+            const ux1 = Math.max(ax1, bx1);
+            const uy1 = Math.max(ay1, by1);
+            const merged = {
+              index: 0,
+              x: ux0,
+              y: uy0,
+              w: ux1 - ux0 + 1,
+              h: uy1 - uy0 + 1,
+              cx: Math.round((ux0 + ux1) / 2),
+              cy: Math.round((uy0 + uy1) / 2),
+            };
+            // Reject merged box that exceeds the maxSide budget — that
+            // means we're combining two genuinely separate slots.
+            if (merged.w > maxSide || merged.h > maxSide) continue;
+            candidates[i] = merged;
+            candidates.splice(j, 1);
+            changed = true;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+
+  // Raster-order by clustering slots into row groups using a tight cy
+  // tolerance, then sorting each row by cx. The previous version
+  // quantized cy by stride which mis-grouped neighboring slots that
+  // straddled a stride boundary -- so the SoM badges came out in
+  // jumbled order (e.g. hotbar reading 42, 40, 41, 43, ...) and the
+  // agent could not reason about "the next slot to the right".
+  // Wide tolerance: bbox cy can shift upward by several pixels when
+  // an item icon occupies the slot, so a strict tolerance jumbles
+  // neighboring slots in the same physical row.
+  const ROW_TOL = Math.max(6, Math.round(expectedSide * 0.6));
+  const sortedByY = [...candidates].sort((a, b) => a.cy - b.cy);
+  const rows: Array<typeof sortedByY> = [];
+  for (const s of sortedByY) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].cy - s.cy) <= ROW_TOL) last.push(s);
+    else rows.push([s]);
+  }
+  for (const row of rows) row.sort((a, b) => a.cx - b.cx);
+  const flattened = rows.flat();
+  flattened.forEach((s, i) => { s.index = i; });
+  // Mutate the original candidates array order to match for downstream consumers.
+  candidates.length = 0;
+  for (const s of flattened) candidates.push(s);
 
   return {
     windowX: bbox.x,
@@ -859,14 +1035,23 @@ function annotateWithLayout(
     out.push({ index: 0, cx: u.cx, cy: u.cy, w: u.w, h: u.h });
   }
 
-  // 3. Re-sort raster order and re-index.
-  const stride = Math.max(8, Math.round(disc.slotPx * 1.1));
-  out.sort((a, b) => {
-    const ra = Math.round(a.cy / stride);
-    const rb = Math.round(b.cy / stride);
-    if (ra !== rb) return ra - rb;
-    return a.cx - b.cx;
-  });
+  // 3. Re-sort raster order and re-index. Cluster by cy with a wider
+  // tolerance because bbox cy can shift upward when an item icon
+  // occupies the slot (the icon's bounding box pulls the centroid up
+  // by ~3-5 px relative to an empty slot); a stride-based row
+  // assignment then jumbles neighbors. ROW_TOL ~ 0.6 * slot side
+  // tolerates that shift while still separating distinct physical rows.
+  const ROW_TOL = Math.max(6, Math.round(disc.slotPx * 0.6));
+  const sortedByY = [...out].sort((a, b) => a.cy - b.cy);
+  const rows: Array<typeof sortedByY> = [];
+  for (const s of sortedByY) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].cy - s.cy) <= ROW_TOL) last.push(s);
+    else rows.push([s]);
+  }
+  for (const row of rows) row.sort((a, b) => a.cx - b.cx);
+  out.length = 0;
+  for (const s of rows.flat()) out.push(s);
   out.forEach((s, i) => { s.index = i; });
 
   return out;
@@ -943,6 +1128,17 @@ function fillGridGaps(disc: DiscoveredLayout): DiscoveredSlot[] {
     }
   }
   return filled;
+}
+
+/** Adapter for the Dispatcher GUI gate. Returns slots[] or empty on any error.
+ *  Uses discoverSlots internally -- pure CV, no layout assumption. */
+export function detectGuiSlots(imageBase64: string): { slots: Array<{ index: number; cx?: number; cy?: number }> } {
+  try {
+    const result = discoverSlots(imageBase64);
+    return { slots: result?.slots ?? [] };
+  } catch {
+    return { slots: [] };
+  }
 }
 
 /** GENERAL DETECTION POLICY entry point.
